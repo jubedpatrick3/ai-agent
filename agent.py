@@ -4,38 +4,38 @@ Pharma Brand Detection Agent - Web Interaction Channel
 Pulls URLs from Snowflake, scrapes page content, and uses Claude AI
 to detect pharmaceutical brand names and promomat IDs (MAT-*).
 
+ZERO external dependencies - uses only Python standard library.
+Snowflake connector is the only exception (already available on company tools).
+
 Usage:
-    cp .env.example .env   # fill in credentials
-    pip install -r requirements.txt
+    Set environment variables (or edit the config section below), then:
     python agent.py
 """
 
+import csv
+import json
 import os
 import re
+import ssl
 import time
-
-import anthropic
-import pandas as pd
-import requests
-import snowflake.connector
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-
-load_dotenv()
+from html.parser import HTMLParser
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 # ── Configuration ────────────────────────────────────────────────────────────
+# Edit these directly OR set matching environment variables
 
 SNOWFLAKE_CONFIG = {
-    "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-    "user": os.getenv("SNOWFLAKE_USER"),
-    "password": os.getenv("SNOWFLAKE_PASSWORD"),
-    "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+    "account": os.getenv("SNOWFLAKE_ACCOUNT", ""),
+    "user": os.getenv("SNOWFLAKE_USER", ""),
+    "password": os.getenv("SNOWFLAKE_PASSWORD", ""),
+    "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", ""),
     "database": os.getenv("SNOWFLAKE_DATABASE", "DF_CI_PROD"),
     "schema": os.getenv("SNOWFLAKE_SCHEMA", "DMT_CIA_SS"),
-    "role": os.getenv("SNOWFLAKE_ROLE"),
+    "role": os.getenv("SNOWFLAKE_ROLE", ""),
 }
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 WEB_INTERACTION_QUERY = """
 SELECT page_url, page_title
@@ -49,13 +49,11 @@ REQUEST_DELAY_SECONDS = 1
 OUTPUT_DIR = "output"
 OUTPUT_FILE = "pharma_brand_detection_results.csv"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 SYSTEM_PROMPT = """You are a pharmaceutical brand detection specialist. Your job is to analyze web page content and identify:
 
@@ -87,40 +85,110 @@ CONFIDENCE: HIGH/MEDIUM/LOW
 NOTES: Any relevant context about the findings"""
 
 
+# ── HTML Parser (stdlib replacement for BeautifulSoup) ───────────────────────
+
+class TextExtractor(HTMLParser):
+    """Extract visible text from HTML, skipping script/style/nav/footer/header."""
+
+    SKIP_TAGS = {"script", "style", "nav", "footer", "header", "noscript"}
+
+    def __init__(self):
+        super().__init__()
+        self._skip_depth = 0
+        self._pieces = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            text = data.strip()
+            if text:
+                self._pieces.append(text)
+
+    def get_text(self):
+        return "\n".join(self._pieces)
+
+
+def extract_text_from_html(html: str) -> str:
+    parser = TextExtractor()
+    parser.feed(html)
+    return parser.get_text()[:15000]
+
+
 # ── Snowflake ────────────────────────────────────────────────────────────────
 
-def fetch_web_interactions() -> pd.DataFrame:
-    conn = snowflake.connector.connect(**SNOWFLAKE_CONFIG)
+def fetch_web_interactions() -> list:
+    """Fetch page_url and page_title from Snowflake. Returns list of dicts."""
+    import snowflake.connector  # available on company tools
+
+    config = {k: v for k, v in SNOWFLAKE_CONFIG.items() if v}
+    conn = snowflake.connector.connect(**config)
     try:
         cursor = conn.cursor()
         cursor.execute(WEB_INTERACTION_QUERY)
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
-        df = pd.DataFrame(rows, columns=columns)
-        print(f"Fetched {len(df)} rows from Snowflake")
-        return df
+        data = [dict(zip(columns, row)) for row in rows]
+        print(f"Fetched {len(data)} rows from Snowflake")
+        return data
     finally:
         conn.close()
 
 
-# ── Web Scraper ──────────────────────────────────────────────────────────────
+# ── Web Scraper (stdlib urllib) ──────────────────────────────────────────────
 
 def scrape_page(url: str) -> dict:
+    """Scrape a URL using only stdlib urllib."""
+    ctx = ssl.create_default_context()
+
     for attempt in range(MAX_RETRIES + 1):
         try:
-            response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, verify=True)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "lxml")
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
-                tag.decompose()
-            text = soup.get_text(separator="\n", strip=True)[:15000]
+            req = Request(url, headers={"User-Agent": USER_AGENT})
+            with urlopen(req, timeout=REQUEST_TIMEOUT, context=ctx) as resp:
+                raw = resp.read()
+                # try utf-8 first, fall back to latin-1
+                try:
+                    html = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    html = raw.decode("latin-1")
+            text = extract_text_from_html(html)
             return {"url": url, "success": True, "text": text, "error": None}
-        except requests.RequestException as e:
+        except (URLError, HTTPError, OSError) as e:
             if attempt < MAX_RETRIES:
                 time.sleep(REQUEST_DELAY_SECONDS)
                 continue
             return {"url": url, "success": False, "text": "", "error": str(e)}
     return {"url": url, "success": False, "text": "", "error": "Max retries exceeded"}
+
+
+# ── Claude API (stdlib urllib, no anthropic SDK) ─────────────────────────────
+
+def call_claude_api(system: str, user_message: str) -> str:
+    """Call the Anthropic Messages API using only stdlib."""
+    url = "https://api.anthropic.com/v1/messages"
+    payload = json.dumps({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 1024,
+        "system": system,
+        "messages": [{"role": "user", "content": user_message}],
+    }).encode("utf-8")
+
+    req = Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("x-api-key", ANTHROPIC_API_KEY)
+    req.add_header("anthropic-version", "2023-06-01")
+
+    ctx = ssl.create_default_context()
+    with urlopen(req, timeout=60, context=ctx) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+
+    return body["content"][0]["text"]
 
 
 # ── AI Analyzer ──────────────────────────────────────────────────────────────
@@ -148,30 +216,21 @@ def analyze_page(url: str, page_title: str, page_content: str) -> dict:
     if not page_content.strip():
         return {
             "url": url, "page_title": page_title, "brands": [], "mat_ids": [],
-            "confidence": "N/A", "notes": "Empty page content", "raw_response": "",
+            "confidence": "N/A", "notes": "Empty page content",
         }
 
+    # Regex pre-scan for MAT IDs
     regex_mat_ids = re.findall(r"MAT[-\s]?[A-Z0-9\-]+", page_content, re.IGNORECASE)
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": USER_PROMPT_TEMPLATE.format(
-                url=url, page_title=page_title, content=page_content
-            ),
-        }],
+    user_msg = USER_PROMPT_TEMPLATE.format(
+        url=url, page_title=page_title, content=page_content
     )
-
-    raw = message.content[0].text
+    raw = call_claude_api(SYSTEM_PROMPT, user_msg)
     result = parse_analysis_response(raw)
     result["url"] = url
     result["page_title"] = page_title
-    result["raw_response"] = raw
 
+    # Merge regex-found MAT IDs with AI-found ones
     all_mat_ids = set(result["mat_ids"])
     for mat_id in regex_mat_ids:
         cleaned = mat_id.strip()
@@ -180,6 +239,19 @@ def analyze_page(url: str, page_title: str, page_content: str) -> dict:
     result["mat_ids"] = sorted(all_mat_ids)
 
     return result
+
+
+# ── CSV Writer (stdlib replacement for pandas) ──────────────────────────────
+
+def write_csv(filepath: str, rows: list):
+    """Write list of dicts to CSV using stdlib csv module."""
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 # ── Main Agent Pipeline ──────────────────────────────────────────────────────
@@ -191,21 +263,30 @@ def run_agent():
     print("PHARMA BRAND DETECTION AGENT")
     print("=" * 60)
 
+    # Step 1: Fetch from Snowflake
     print("\n[1/3] Fetching web interaction data from Snowflake...")
-    df = fetch_web_interactions()
-    if df.empty:
+    data = fetch_web_interactions()
+    if not data:
         print("No data found. Exiting.")
         return
 
-    df = df.drop_duplicates(subset=["PAGE_URL"]).reset_index(drop=True)
-    print(f"  -> {len(df)} unique URLs to process\n")
+    # Deduplicate by PAGE_URL
+    seen = set()
+    unique_data = []
+    for row in data:
+        url = row.get("PAGE_URL", "")
+        if url and url not in seen:
+            seen.add(url)
+            unique_data.append(row)
+    print(f"  -> {len(unique_data)} unique URLs to process\n")
 
+    # Step 2: Scrape and analyze
     print("[2/3] Scraping and analyzing pages...")
     results = []
-    total = len(df)
+    total = len(unique_data)
 
-    for idx, row in df.iterrows():
-        url = row["PAGE_URL"]
+    for idx, row in enumerate(unique_data):
+        url = row.get("PAGE_URL", "")
         page_title = row.get("PAGE_TITLE", "")
         print(f"  [{idx + 1}/{total}] {url[:80]}...")
 
@@ -215,7 +296,7 @@ def run_agent():
             results.append({
                 "page_url": url, "page_title": page_title, "brands_found": "",
                 "mat_ids_found": "", "confidence": "N/A",
-                "notes": f"Scrape failed: {scraped['error']}", "scrape_success": False,
+                "notes": f"Scrape failed: {scraped['error']}", "scrape_success": "False",
             })
             continue
 
@@ -226,28 +307,29 @@ def run_agent():
         results.append({
             "page_url": url, "page_title": page_title, "brands_found": brands_str,
             "mat_ids_found": mat_ids_str, "confidence": analysis["confidence"],
-            "notes": analysis["notes"], "scrape_success": True,
+            "notes": analysis["notes"], "scrape_success": "True",
         })
 
         if brands_str or mat_ids_str:
             print(f"    -> Brands: {brands_str or 'None'}")
             print(f"    -> MAT IDs: {mat_ids_str or 'None'}")
         else:
-            print(f"    -> No pharma brands or MAT IDs detected")
+            print("    -> No pharma brands or MAT IDs detected")
 
         time.sleep(REQUEST_DELAY_SECONDS)
 
+    # Step 3: Save results
     print(f"\n[3/3] Saving results...")
-    results_df = pd.DataFrame(results)
     output_path = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
-    results_df.to_csv(output_path, index=False)
+    write_csv(output_path, results)
     print(f"  -> Results saved to {output_path}")
 
+    # Summary
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
     total_processed = len(results)
-    success_count = sum(1 for r in results if r["scrape_success"])
+    success_count = sum(1 for r in results if r["scrape_success"] == "True")
     brand_count = sum(1 for r in results if r["brands_found"])
     mat_count = sum(1 for r in results if r["mat_ids_found"])
     print(f"  Total URLs processed: {total_processed}")
@@ -255,12 +337,11 @@ def run_agent():
     print(f"  Pages with brands:    {brand_count}")
     print(f"  Pages with MAT IDs:   {mat_count}")
 
-    findings_df = results_df[
-        (results_df["brands_found"] != "") | (results_df["mat_ids_found"] != "")
-    ]
-    if not findings_df.empty:
+    # Filtered findings
+    findings = [r for r in results if r["brands_found"] or r["mat_ids_found"]]
+    if findings:
         findings_path = os.path.join(OUTPUT_DIR, "pharma_findings_only.csv")
-        findings_df.to_csv(findings_path, index=False)
+        write_csv(findings_path, findings)
         print(f"\n  Filtered results (findings only) saved to {findings_path}")
     else:
         print("\n  No pharma brands or MAT IDs were detected in any pages.")
